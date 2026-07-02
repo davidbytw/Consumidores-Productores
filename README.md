@@ -372,3 +372,6 @@ el consumidor se cuela en ese instante y se lleva lo que había en la caja: un
 valor **viejo** (Caso 1), **vacío/`null`** (Caso 2), o **repetido** entre varios
 consumidores (Caso 4). Cambiar los tiempos solo cambia **cuál** de estos síntomas
 aparece; no arregla nada.
+=======
+# Consumidores-Productores
+
