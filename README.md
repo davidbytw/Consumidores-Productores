@@ -197,3 +197,178 @@ detectaría**: ese detector solo ve threads bloqueados esperando locks/monitores
 `next()` con `synchronized`, y reemplazar la espera activa por bloqueo real con
 `wait()/notify()` (o `notifyAll()`), de modo que el comportamiento sea correcto
 **independientemente** de los tiempos y de la cantidad de productores/consumidores.
+
+---
+
+# Explicación intuitiva (paso a paso, sin tecnicismos)
+
+Esta sección explica el **mismo** problema de arriba, pero contado en cámara lenta
+y con analogías. Es la parte que más cuesta entender la primera vez.
+
+## 1. Cómo funciona el buffer por dentro (el anillo de cajas)
+
+El `CircularBuffer` es un **anillo de 10 cajas** numeradas del 0 al 9:
+
+```
+        caja:  0   1   2   3   4   5   6   7   8   9
+```
+
+Hay **dos marcadores** que se persiguen alrededor del anillo:
+
+- **`lastElem` = marcador de ESCRITURA** → dónde el productor va a dejar el
+  próximo elemento.
+- **`posNext` = marcador de LECTURA** → de dónde el consumidor va a sacar el
+  próximo elemento.
+
+**Reglas del juego:**
+
+- El productor deja su elemento en **su** caja (`lastElem`) y mueve **su**
+  marcador una caja adelante.
+- El consumidor saca el elemento de **su** caja (`posNext`) y mueve **su**
+  marcador una caja adelante.
+- Si los **dos marcadores están en la MISMA caja → el buffer está VACÍO** → el
+  consumidor **espera**.
+- Como es un anillo, después de la caja 9 se vuelve a la caja 0 (por eso el
+  `% length` en el código: `(indice + 1) % 10`).
+
+**Idea central que hay que retener:** el consumidor **NO agarra "lo último que se
+agregó"**. El consumidor **siempre lee de SU marcador (`posNext`)**, sea lo que
+sea que haya en esa caja. Y las cajas **nunca se borran**: cuando un elemento se
+consume, su texto **queda ahí** hasta que alguien lo **sobrescriba** una vuelta
+después.
+
+## 2. El bug, en una sola frase
+
+En `add()`, el productor hace dos cosas en el **orden equivocado**:
+
+```java
+public void add(T data) {
+    ...
+    this.lastElem = (this.lastElem+1) % length;  // ①  AVISA "hay uno nuevo" (mueve el marcador)
+    this.elements[p] = data;                      // ②  RECIÉN ACÁ escribe el valor
+}
+```
+
+Primero **avisa** (①) y después **escribe** (②). Y como no hay candado, el
+consumidor puede colarse **justo en el medio**, cuando ya avisaste pero todavía
+no escribiste.
+
+## 3. Analogía del mozo y la campanita
+
+Un mozo (productor) le deja un plato a un cliente (consumidor):
+
+- **Forma correcta:** apoya el plato 🍽️ y **después** toca la campanita 🔔. El
+  cliente escucha, mira la mesa, el plato está. Todo bien.
+- **Forma del código (rota):** toca la campanita 🔔 **primero** y **después** va
+  a buscar el plato 🍽️. Si el cliente es rápido y mete la mano apenas suena la
+  campanita, **el plato todavía no está** → se lleva lo que hubiera de antes (un
+  plato viejo) o nada.
+
+El "avisar antes de escribir" es exactamente tocar la campanita antes de apoyar
+el plato.
+
+## 4. Caso 1 en cámara lenta — de dónde sale el "69" en vez del "79"
+
+Recordá: el buffer tiene 10 cajas, así que el elemento **79** y el **69** caen en
+la **misma caja** (`79 % 10 = 9` y `69 % 10 = 9`). Cada 10 elementos se reusa la
+misma caja física.
+
+**Situación de partida:** ya se consumió hasta el 78. Los dos marcadores quedaron
+**juntos en la caja 9** → buffer VACÍO → el consumidor está esperando. La caja 9
+**todavía dice "69"** (basura vieja de 10 elementos atrás, nunca borrada).
+
+```
+caja 9 contiene: "69"      ← basura vieja
+R (posNext)  = 9           ← consumidor esperando acá
+W (lastElem) = 9           ← productor a punto de escribir acá
+R == W  →  VACÍO  →  el consumidor espera
+```
+
+**El productor ejecuta `add("79")`:**
+
+**Paso ① — avisa (mueve el marcador de escritura):**
+```
+W pasa de 9  →  0
+Ahora:  R = 9,  W = 0   →   R ≠ W   →   el buffer "parece que tiene algo"
+```
+⚠️ Pero la caja 9 **todavía dice "69"**. El 79 NO está escrito aún.
+
+**Paso — el consumidor, que esperaba, se despierta:**
+```java
+while(posNext == lastElem){ }   // 9 == 0 ? NO → deja de esperar
+T e = elements[9];              // lee la caja 9 → agarra "69"   ❌ (viejo)
+posNext = 0;                    // mueve su marcador
+```
+
+**Paso ② — recién ahora el productor escribe:**
+```
+caja 9 = "79"     ← tarde: el consumidor ya pasó de la caja 9
+```
+
+**Resultado de ese único cruce:**
+- El **69** se consume **por segunda vez** (duplicado).
+- El **79** queda guardado en la caja 9 pero **nadie lo lee nunca**: para cuando
+  `posNext` vuelva a la caja 9 (una vuelta después), ya fue **sobrescrito por el
+  89**. → el **79 se pierde**.
+
+Por eso en el log hay **tantos duplicados como pérdidas**, y por eso aparece
+`Generando: 79` pero **nunca** `consumió 79`.
+
+## 5. Aclaración importante: NO es un "desfasaje" constante
+
+Un error común es pensar que todo se **corre una posición** de forma permanente
+(leo 70 donde iba 71, 71 donde iba 72, etc.). **No es así.**
+
+Cada lectura mala es un **evento aislado**: el consumidor pasó por **una** caja
+justo en el instante malo (marcador movido, valor sin escribir) y se llevó lo
+viejo de **esa** caja puntual. La caja siguiente puede leerla **bien**.
+
+Evidencia en el log real:
+```
+Generando: Elemento: 78  →  consumió: Elemento: 78    ✅ bien
+Generando: Elemento: 79  →  consumió: Elemento: 69    ❌ viejo (79 − 10)
+Generando: Elemento: 80  →  consumió: Elemento: 80    ✅ bien
+Generando: Elemento: 81  →  consumió: Elemento: 71    ❌ viejo (81 − 10)
+```
+
+Fijate: después del **69** (malo) tomó **80** (bien), no 70. El 70 ya se había
+consumido bien en su propia vuelta, antes. **Buenos y malos aparecen mezclados**,
+no corridos parejo. Cada anomalía es un "swap" independiente: **un valor viejo
+re-leído + un valor nuevo perdido**, en esa caja, en ese instante.
+
+## 6. Los otros casos, contados con la misma analogía
+
+- **Caso 2 (consumidor rápido → `null`):** misma película pero **al revés**. El
+  consumidor se adelanta a una caja que el productor **nunca escribió todavía**.
+  En vez de encontrar "un plato viejo", la caja está **realmente vacía** → en
+  Java eso es `null`. Como el marcador de lectura llega a **sobrepasar** al de
+  escritura, la condición de "vacío" no se cumple hasta dar toda la vuelta al
+  anillo → por eso salen **ráfagas de `null`** de largo ≈ 10 (el tamaño del
+  anillo).
+
+- **Caso 3 (bien alternados → "funciona"):** exactamente el mismo código roto.
+  Simplemente los tiempos hicieron que cuando uno tocaba el buffer, el otro
+  estaba dormido en su `wait(...)`, así que **nunca se cruzaron en el instante
+  malo**. Salió bien **de casualidad**, no porque el código sea correcto. Lección:
+  *que un programa concurrente "funcione" una o mil veces NO prueba que sea
+  correcto.*
+
+- **Caso 4 (varios consumidores → cuelgue):** ahora los consumidores se pelean
+  **entre ellos**. Varios miran el mismo marcador `posNext` a la vez, leen la
+  **misma caja** y recién después mueven el marcador, pisándose → el **mismo
+  elemento se entrega a muchos consumidores**. Como consumen basura (duplicados y
+  `null`), **terminan su cuota antes de vaciar el buffer** y se mueren. Sin
+  consumidores vivos, el productor **llena las 10 cajas** y se queda **girando
+  para siempre** en el busy-wait de `add()` (buffer lleno, nadie consume). El
+  programa **nunca termina** (se confirmó en la ejecución: hubo que abortarlo).
+  Es un **livelock**, no un deadlock de locks → el detector automático NO lo
+  agarra.
+
+## 7. La causa de TODO, en una línea
+
+El productor **avisa que hay un elemento nuevo (mueve el marcador) ANTES de
+escribirlo**, y como no hay sincronización (`synchronized` / `wait` / `notify`),
+el consumidor se cuela en ese instante y se lleva lo que había en la caja: un
+valor **viejo** (Caso 1), **vacío/`null`** (Caso 2), o **repetido** entre varios
+consumidores (Caso 4). Cambiar los tiempos solo cambia **cuál** de estos síntomas
+aparece; no arregla nada.
