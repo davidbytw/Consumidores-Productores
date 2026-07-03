@@ -58,8 +58,9 @@ Dos problemas centrales:
    la ventana entre ambos, un consumidor cree que hay un elemento y lee la celda
    **antes** de que sea escrita.
 2. **Espera activa (busy-wait)** en lugar de bloqueo: quema CPU y, sobre todo,
-   la condición de "lleno/vacío" (`posNext == lastElem`) **no es confiable**
-   cuando los índices se actualizan sin atomicidad.
+   deja al hilo que espera **apostado sobre la ventana crítica**: chequea la
+   condición millones de veces por segundo, así que el nanosegundo en que el
+   índice se publica, se abalanza — muchas veces antes de que el dato exista.
 
 Detalle adicional: `size()` usa `%` sobre una resta que **puede dar negativo**
 (en Java el módulo conserva el signo del dividendo).
@@ -94,25 +95,47 @@ la sobrescriba, obteniendo el valor de hace 10 iteraciones. El elemento nuevo se
 escribe tarde (cuando `posNext` ya pasó) → **se pierde**. Hay tantas pérdidas
 como duplicados. `size() = 0` al final **no** prueba correctitud.
 
-### Caso 2 — Consumidor más rápido: `null` + duplicados
+### Caso 2 — Consumidor más rápido: `null` + relectura tardía
 
-Un productor, un consumidor, pero el consumidor corre más rápido y **sobrepasa**
-al productor.
+Un productor, un consumidor, pero el consumidor corre más rápido: pasa casi
+toda su vida girando dentro de `next()`, mirando `lastElem` millones de veces
+por segundo.
 
-**Firma:** ráfagas de `null` de longitud ≈ tamaño del buffer, seguidas de una
-relectura de los mismos elementos:
+**Firma:** una tanda de `null` de largo ≈ tamaño del buffer (primera vuelta),
+seguida de la aparición **tardía** de los primeros elementos (segunda vuelta):
 
 ```
-Generando: Elemento: 1  →  consumió: null   (× ~8)
-                        →  consumió: Elemento: 0   (duplicado)
-                        →  consumió: Elemento: 1..9 (relectura)
+consumió: null   (× ~10, primera vuelta: celdas vírgenes)
+consumió: Elemento: 0    (segunda vuelta: lo escrito tarde en la vuelta 1)
+consumió: Elemento: 1..9 (ídem)
 ```
 
-**Por qué:** las celdas arrancan en `null`. El consumidor lee posiciones **aún
-no escritas**. Como `posNext` **sobrepasa** a `lastElem`, la condición de "vacío"
-no vuelve a cumplirse hasta que `posNext` da toda la vuelta al buffer → por eso
-la ráfaga de `null` mide casi una vuelta completa (≈10). Al completar la vuelta,
-re-lee celdas viejas → duplicados; los que salieron como `null` **se perdieron**.
+**Por qué:** como el consumidor está apostado en el busy-wait, la carrera de
+①→② se dispara en **casi cada `add()`**: apenas el productor publica el índice,
+el consumidor lee la celda antes de que el dato llegue. La película tiene dos
+vueltas:
+
+- **Primera vuelta (celdas 0..9):** el buffer recién arranca y las celdas
+  tienen el valor inicial de un array de objetos en Java: `null`. El consumidor
+  lee `null` en cada carrera; cada "Elemento: k" se escribe **tarde**, en una
+  celda por la que el lector ya pasó, y queda ahí guardado.
+- **Segunda vuelta:** `posNext` vuelve a la celda 0, que ahora contiene el
+  "Elemento: 0" rezagado de la vuelta anterior. Nueva carrera → lo lee. Por eso
+  los primeros elementos aparecen consumidos, pero **una vuelta tarde** (es la
+  misma firma N − 10 del Caso 1, arrancando desde celdas vacías).
+
+**Contabilidad:** los elementos leídos como `null` **no** son los que se
+pierden — esos se consumen tarde, en la vuelta siguiente. Los que se pierden
+son los de la **última vuelta**: se escriben tarde y ya no hay otra vuelta que
+los rescate. La **cantidad** sí coincide: hay tantos elementos perdidos como
+`null` consumidos, porque cada `null` es una lectura "gastada" en nada y la
+cuota del consumidor es fija.
+
+**Precisión importante:** como número, `posNext` nunca sobrepasa a `lastElem`
+(el consumidor avanza de a uno y solo tras ver el índice publicado; a lo sumo
+lo alcanza). Lo que el lector sobrepasa son **los datos**: corre siempre un
+paso adelante de la realidad escrita, leyendo celdas cuyo contenido verdadero
+llega un instante tarde. Sobrepasa a los platos, no a la campanita.
 
 ### Caso 3 — Bien alternados: "funciona"… por suerte
 
@@ -175,7 +198,7 @@ detectaría**: ese detector solo ve threads bloqueados esperando locks/monitores
 | Caso | Configuración | Síntoma | Mecanismo |
 |------|---------------|---------|-----------|
 | 1 | Productor rápido | Valores viejos (`N − tamañoBuffer`) + pérdidas | `add()` publica índice antes de escribir dato |
-| 2 | Consumidor rápido | Ráfagas de `null` + duplicados | Lee celdas no escritas; `posNext` sobrepasa a `lastElem` |
+| 2 | Consumidor rápido | Tanda de `null` + relectura tardía | Lee celdas antes de que se escriban; el lector corre adelantado a los datos |
 | 3 | Bien alternados | "Funciona" (engañoso) | No coincidieron en la ventana crítica (suerte) |
 | 4 | Varios consumidores | Mismo elemento a N consumidores + **cuelgue** | `next()` no atómico; buffer se llena sin consumidores → **livelock** |
 
@@ -236,6 +259,14 @@ agregó"**. El consumidor **siempre lee de SU marcador (`posNext`)**, sea lo que
 sea que haya en esa caja. Y las cajas **nunca se borran**: cuando un elemento se
 consume, su texto **queda ahí** hasta que alguien lo **sobrescriba** una vuelta
 después.
+
+**Otra idea clave (fuente típica de confusión):** el marcador de cada uno apunta
+a la caja donde va a operar **AHORA**, no a la siguiente. En `add()`, el
+productor primero guarda `p = lastElem` (su caja actual), después mueve el
+marcador, y escribe en `p` — **no** en la caja nueva. Mover el marcador es
+*reservar*: "esta caja ya es mía; el próximo elemento va a la que sigue". Como
+el turnero de la panadería: el número que muestra el aparato es el tuyo, y al
+sacarlo avanza para el que viene atrás.
 
 ## 2. El bug, en una sola frase
 
@@ -338,13 +369,20 @@ re-leído + un valor nuevo perdido**, en esa caja, en ese instante.
 
 ## 6. Los otros casos, contados con la misma analogía
 
-- **Caso 2 (consumidor rápido → `null`):** misma película pero **al revés**. El
-  consumidor se adelanta a una caja que el productor **nunca escribió todavía**.
-  En vez de encontrar "un plato viejo", la caja está **realmente vacía** → en
-  Java eso es `null`. Como el marcador de lectura llega a **sobrepasar** al de
-  escritura, la condición de "vacío" no se cumple hasta dar toda la vuelta al
-  anillo → por eso salen **ráfagas de `null`** de largo ≈ 10 (el tamaño del
-  anillo).
+- **Caso 2 (consumidor rápido → `null`):** el cliente hambriento vive parado
+  al lado de la campanita. **Cada vez** que suena, mete la mano antes de que
+  llegue el plato. Al principio del programa las mesas están **realmente
+  vacías** (las cajas arrancan en su valor inicial de Java: `null`) → primera
+  vuelta al anillo: puros `null`, uno por cada campanita. Los platos llegan
+  tarde y quedan servidos en mesas por las que el cliente ya pasó. En la
+  **segunda vuelta**, el cliente vuelve a esas mesas y encuentra los platos
+  rezagados de la vuelta anterior: por eso el "Elemento: 0", el 1, el 2...
+  aparecen consumidos, pero **una vuelta tarde**. Los que se pierden de verdad
+  son los platos de la **última vuelta**: llegan tarde y ya no hay otra pasada
+  que los rescate. Ojo con un detalle: el marcador de lectura **nunca sobrepasa
+  al de escritura como número** (avanza de a uno y a lo sumo lo alcanza); a lo
+  que le gana es **a los datos**, que llegan siempre un instante después del
+  aviso.
 
 - **Caso 3 (bien alternados → "funciona"):** exactamente el mismo código roto.
   Simplemente los tiempos hicieron que cuando uno tocaba el buffer, el otro
@@ -372,4 +410,3 @@ el consumidor se cuela en ese instante y se lleva lo que había en la caja: un
 valor **viejo** (Caso 1), **vacío/`null`** (Caso 2), o **repetido** entre varios
 consumidores (Caso 4). Cambiar los tiempos solo cambia **cuál** de estos síntomas
 aparece; no arregla nada.
-
